@@ -90,17 +90,21 @@ class SWAGInference(object):
         #  as a dictionary that maps from weight name to values.
         #  Hint: you never need to consider the full vector of weights,
         #  but can always act on per-layer weights (in the format that _create_weight_copy() returns)
-        self.swag_mean_weights = self._create_weight_copy()  # All zero copy
-        self.swag_var_weights = self._create_weight_copy()
+        self.swag_mom1 = self._create_weight_copy()  # All zero copy
+        self.swag_mom2 = self._create_weight_copy()
         self.n = 0
 
         # Full SWAG
         # TODO(2): create attributes for SWAG-full
         #  Hint: check collections.deque
+        self.swag_deviations_deque = collections.deque(maxlen=self.max_rank_deviation_matrix)
 
         # Calibration, prediction, and other attributes
         # TODO(2): create additional attributes, e.g., for calibration
         self._calibration_threshold = None  # this is an example, feel free to be creative
+
+        self.history = {}
+        self.last_bma_variances = None
 
     def update_swag_statistics(self) -> None:
         """
@@ -113,16 +117,25 @@ class SWAGInference(object):
         # SWAG-diagonal
         for name, param in copied_params.items():
             # TODO(1): update SWAG-diagonal attributes for weight `name` using `copied_params` and `param`
-            self.swag_mean_weights[name] = (self.n / (self.n + 1)) * self.swag_mean_weights[name] + (1 / (self.n + 1)) * param
-            self.swag_var_weights[name] = (self.n / (self.n + 1)) * self.swag_var_weights[name] + (1 / (self.n + 1)) * param ** 2  #  - self.swag_mean_weights[name]). FIXME: Is this correct?
+            # assert (self.swag_mom2[name] >= self.swag_mom1[name]**2).all()
+            self.swag_mom1[name] = (self.n / (self.n + 1)) * self.swag_mom1[name] + (1 / (self.n + 1)) * param  # First moment
+            self.swag_mom2[name] = (self.n / (self.n + 1)) * self.swag_mom2[name] + (1 / (self.n + 1)) * param ** 2  # Uncentered second moment
+            # assert (self.swag_mom2[name] >= self.swag_mom1[name]**2).all()
 
-        # Full SWAG
-        if self.inference_mode == InferenceType.SWAG_FULL:
+        # Full SWAG. Only save deviations for the last max_rank_deviation_matrix epochs
+        if (self.inference_mode == InferenceType.SWAG_FULL) and (self.n >= self.swag_training_epochs - self.max_rank_deviation_matrix):  
             # TODO(2): update full SWAG attributes for weight `name` using `copied_params` and `param`
-            raise NotImplementedError("Update full SWAG statistics")
+
+            deviations = {}
+            for name, param in copied_params.items():
+                deviations[name] = param - self.swag_mom1[name]
+            self.swag_deviations_deque.append(deviations)
         
         self.n += 1
-        
+
+    def log(self, log_dict: dict):
+        for key, value in log_dict.items():
+            self.history[key] = self.history.get(key, []) + [value]
 
     def fit_swag_model(self, loader: torch.utils.data.DataLoader) -> None:
         """
@@ -160,33 +173,33 @@ class SWAGInference(object):
             progress_dict = {}
             for epoch in pbar:
                 avg_loss = 0.0
-                avg_accuracy = 0.0
+                avg_acc = 0.0
                 num_samples = 0
-                for batch_images, batch_snow_labels, batch_cloud_labels, batch_labels in loader:
+                for i, (batch_images, batch_snow_labels, batch_cloud_labels, batch_labels) in enumerate(loader):
                     optimizer.zero_grad()
                     predictions = self.network(batch_images)
                     batch_loss = loss_fn(input=predictions, target=batch_labels)
                     batch_loss.backward()
                     optimizer.step()
-                    progress_dict["lr"] = lr_scheduler.get_last_lr()[0]
+                    lr = lr_scheduler.get_last_lr()[0]
+                    progress_dict["lr"] = lr
                     lr_scheduler.step()
 
                     # Calculate cumulative average training loss and accuracy
-                    avg_loss = (batch_images.size(0) * batch_loss.item() + num_samples * avg_loss) / (
-                        num_samples + batch_images.size(0)
-                    )
-                    avg_accuracy = (
-                        torch.sum(predictions.argmax(dim=-1) == batch_labels).item()
-                        + num_samples * avg_accuracy
-                    ) / (num_samples + batch_images.size(0))
+                    avg_loss = (batch_images.size(0) * batch_loss.item() + num_samples * avg_loss) / (num_samples + batch_images.size(0))
+                    batch_acc = torch.mean((predictions.argmax(dim=-1) == batch_labels).float()).item()
+                    avg_acc = (batch_images.size(0) * batch_acc + num_samples * avg_acc) / (num_samples + batch_images.size(0))
                     num_samples += batch_images.size(0)
                     progress_dict["avg. epoch loss"] = avg_loss
-                    progress_dict["avg. epoch accuracy"] = avg_accuracy
+                    progress_dict["avg. epoch accuracy"] = avg_acc
                     pbar.set_postfix(progress_dict)
+                    self.log({'epoch': epoch, 'batch': i, "loss-batch": batch_loss.item(), 'acc-batch': batch_acc, 'lr': lr})
 
                 # TODO(1): Implement periodic SWAG updates using the attributes defined in __init__
                 if epoch % self.swag_update_interval == 0:
                     self.update_swag_statistics()
+
+
 
     def apply_calibration(self, validation_data: torch.utils.data.Dataset) -> None:
         """
@@ -245,6 +258,8 @@ class SWAGInference(object):
 
         # TODO(1): Average predictions from different model samples into bma_probabilities
         bma_probabilities = torch.mean(torch.stack(model_predictions), dim=0)
+        bma_variances = torch.var(torch.stack(model_predictions), dim=0)
+        self.last_bma_variances = bma_variances
 
         assert bma_probabilities.dim() == 2 and bma_probabilities.size(1) == 6  # N x C
         return bma_probabilities
@@ -256,23 +271,26 @@ class SWAGInference(object):
         Hence, after calling this method, self.network corresponds to a new posterior sample.
         """
 
+        K = len(self.swag_deviations_deque)
+
         # Instead of acting on a full vector of parameters, all operations can be done on per-layer parameters.
         for name, param in self.network.named_parameters():
             # SWAG-diagonal part
-            z_diag = torch.randn(param.size()).to(self.device)
+            z_diag1 = torch.randn(param.size()).to(self.device)
             # TODO(1): Sample parameter values for SWAG-diagonal
-            mean_weights = self.swag_mean_weights[name]
-            std_weights = torch.sqrt(self.swag_var_weights[name])
+            mean_weights = self.swag_mom1[name]
+            std_weights = torch.sqrt(torch.clamp(self.swag_mom2[name] - mean_weights**2, min=0))  # Had problems with negative values?
             assert mean_weights.size() == param.size() and std_weights.size() == param.size()
 
             # Diagonal part
-            sampled_weight = mean_weights + std_weights * z_diag
+            sampled_weight = mean_weights + std_weights * z_diag1 * 1/np.sqrt(2)  # FIXME: Check const
 
             # Full SWAG part
             if self.inference_mode == InferenceType.SWAG_FULL:
                 # TODO(2): Sample parameter values for full SWAG
-                raise NotImplementedError("Sample parameter for full SWAG")
-                sampled_weight += ...
+                z_diag2 = torch.randn(K).to(self.device)
+                Dhat = torch.stack([self.swag_deviations_deque[i][name] for i in range(K)], dim=-1)  # FIXME: Only do this once
+                sampled_weight += torch.matmul(Dhat, z_diag2) * 1/np.sqrt(2*(K-1))
 
             # Modify weight value in-place; directly changing self.network
             param.data = sampled_weight
@@ -324,7 +342,6 @@ class SWAGInference(object):
         You should hence only perform MAP inference yourself after passing the hard baseline
         using the given CNN architecture and pretrained weights.
         """
-
         # MAP inference to obtain initial weights
         PRETRAINED_WEIGHTS_FILE = self.model_dir / "map_weights.pt"
         if USE_PRETRAINED_MODEL:

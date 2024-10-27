@@ -22,6 +22,24 @@ class SWAGScheduler(torch.optim.lr_scheduler.LRScheduler):
     You should not change any other parts of this class.
     """
 
+    # TODO(2): Add and store additional arguments if you decide to implement a custom scheduler
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        epochs: int,
+        steps_per_epoch: int,
+        min_lr: float = 1e-6,
+        max_lr: float = 1e-4,
+        use_cyclical_lr: bool = False
+    ):
+        self.epochs = epochs
+        self.steps_per_epoch = steps_per_epoch
+        self.use_cyclical_lr = use_cyclical_lr
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+
+        super().__init__(optimizer, last_epoch=-1)
+
     def calculate_lr(self, current_epoch: float, previous_lr: float) -> float:
         """
         Calculate the learning rate for the epoch given by current_epoch.
@@ -33,18 +51,12 @@ class SWAGScheduler(torch.optim.lr_scheduler.LRScheduler):
         This method should return a single float: the new learning rate.
         """
         # TODO(2): Implement a custom schedule if desired
-        return previous_lr
-
-    # TODO(2): Add and store additional arguments if you decide to implement a custom scheduler
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        epochs: int,
-        steps_per_epoch: int,
-    ):
-        self.epochs = epochs
-        self.steps_per_epoch = steps_per_epoch
-        super().__init__(optimizer, last_epoch=-1)
+        if self.use_cyclical_lr:
+            c = self.steps_per_epoch
+            t = 1/c * (((self._step_count - 1) % c) + 1)
+            return (1-t) * self.max_lr + t * self.min_lr
+        else:
+            return previous_lr
 
     def get_lr(self):
         if not self._get_lr_called_within_step:
